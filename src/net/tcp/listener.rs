@@ -91,7 +91,7 @@ impl TcpListener {
     /// [`TcpStream`]: struct@crate::net::TcpStream
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (socket, socket_addr) = self.inner.accept().await?;
-        let stream = TcpStream { inner: socket };
+        let stream = TcpStream::new(socket);
         let socket_addr = socket_addr.ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "Could not get socket IP address")
         })?;

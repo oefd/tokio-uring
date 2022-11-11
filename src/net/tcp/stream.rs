@@ -1,11 +1,14 @@
 use std::{
+    future::Future,
     io,
-    net::SocketAddr,
+    net::{Shutdown, SocketAddr},
     os::unix::prelude::{AsRawFd, FromRawFd, RawFd},
+    pin::Pin,
+    task::{Context, Poll},
 };
 
 use crate::{
-    buf::{IoBuf, IoBufMut},
+    buf::{IoBuf, IoBufMut, Slice},
     driver::{SharedFd, Socket},
 };
 
@@ -39,14 +42,24 @@ use crate::{
 /// [`listener`]: crate::net::TcpListener
 pub struct TcpStream {
     pub(super) inner: Socket,
+    read_fut: Option<Pin<Box<dyn Future<Output = crate::BufResult<usize, Slice<Vec<u8>>>>>>>,
+    write_fut: Option<Pin<Box<dyn Future<Output = crate::BufResult<usize, Slice<Vec<u8>>>>>>>,
 }
 
 impl TcpStream {
+    pub(crate) fn new(socket: Socket) -> Self {
+        TcpStream {
+            inner: socket,
+            read_fut: None,
+            write_fut: None,
+        }
+    }
+
     /// Opens a TCP connection to a remote host at the given `SocketAddr`
     pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
         let socket = Socket::new(addr, libc::SOCK_STREAM)?;
         socket.connect(socket2::SockAddr::from(addr)).await?;
-        let tcp_stream = TcpStream { inner: socket };
+        let tcp_stream = Self::new(socket);
         Ok(tcp_stream)
     }
 
@@ -62,11 +75,11 @@ impl TcpStream {
     /// `reuse_address` or binding to multiple addresses.
     pub fn from_std(socket: std::net::TcpStream) -> Self {
         let inner = Socket::from_std(socket);
-        Self { inner }
+        Self::new(inner)
     }
 
     pub(crate) fn from_socket(inner: Socket) -> Self {
-        Self { inner }
+        Self::new(inner)
     }
 
     /// Read some data from the stream into the buffer, returning the original buffer and
@@ -210,5 +223,70 @@ impl FromRawFd for TcpStream {
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
+    }
+}
+
+impl tokio::io::AsyncRead for TcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut read_fut = if let Some(read_fut) = self.read_fut.take() {
+            read_fut
+        } else {
+            let uring_buf = vec![0u8; 4096];
+            self.inner.read_fut(uring_buf.slice(..))
+        };
+
+        match Pin::new(&mut read_fut).poll(cx) {
+            Poll::Pending => {
+                self.read_fut = Some(read_fut);
+                Poll::Pending
+            }
+            Poll::Ready((Ok(bytes_read), uring_buf)) => {
+                let vec = uring_buf.into_inner();
+                buf.put_slice(&vec[0..bytes_read]);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready((Err(err), _uring_buf)) => {
+                panic!("ahhhhhhhhhh (read) {:?}", err)
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for TcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut write_fut = if let Some(write_fut) = self.write_fut.take() {
+            write_fut
+        } else {
+            let uring_buf = buf.to_vec();
+            self.inner.write_fut(uring_buf.slice(..))
+        };
+
+        match Pin::new(&mut write_fut).poll(cx) {
+            Poll::Pending => {
+                self.write_fut = Some(write_fut);
+                Poll::Pending
+            }
+            Poll::Ready((Ok(bytes_written), _uring_buf)) => Poll::Ready(Ok(bytes_written)),
+            Poll::Ready((Err(err), _uring_buf)) => {
+                panic!("ahhhhhhhhhh (write) {:?}", err)
+            }
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(self.inner.shutdown(Shutdown::Write))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        dbg!("i'm just pretending to flush the stream");
+        Poll::Ready(Ok(()))
     }
 }

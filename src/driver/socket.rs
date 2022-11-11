@@ -3,10 +3,12 @@ use crate::{
     driver::{Op, SharedFd},
 };
 use std::{
+    future::Future,
     io,
     net::SocketAddr,
     os::unix::io::{AsRawFd, IntoRawFd, RawFd},
     path::Path,
+    pin::Pin,
 };
 
 #[derive(Clone)]
@@ -44,6 +46,13 @@ impl Socket {
         op.await
     }
 
+    pub(crate) fn write_fut<T: IoBufMut>(
+        &self,
+        buf: T,
+    ) -> Pin<Box<dyn Future<Output = crate::BufResult<usize, T>>>> {
+        Box::pin(Op::write_at(&self.fd, buf, 0).unwrap())
+    }
+
     pub async fn writev<T: IoBuf>(&self, buf: Vec<T>) -> crate::BufResult<usize, Vec<T>> {
         let op = Op::writev_at(&self.fd, buf, 0).unwrap();
         op.await
@@ -66,6 +75,13 @@ impl Socket {
     pub(crate) async fn read<T: IoBufMut>(&self, buf: T) -> crate::BufResult<usize, T> {
         let op = Op::read_at(&self.fd, buf, 0).unwrap();
         op.await
+    }
+
+    pub(crate) fn read_fut<T: IoBufMut>(
+        &self,
+        buf: T,
+    ) -> Pin<Box<dyn Future<Output = crate::BufResult<usize, T>>>> {
+        Box::pin(Op::read_at(&self.fd, buf, 0).unwrap())
     }
 
     pub(crate) async fn recv_from<T: IoBufMut>(
